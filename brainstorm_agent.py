@@ -11,9 +11,9 @@ Usage:
 from dotenv import load_dotenv
 import os
 import asyncio
-from agents import Agent, Runner
-from agents import function_tool
-from typing import List, Dict, Any
+from typing import List, Dict, Any, Optional
+from dataclasses import dataclass, field
+from agents import Agent, Runner, RunContextWrapper, function_tool
 
 # Load environment variables
 load_dotenv()
@@ -22,32 +22,72 @@ load_dotenv()
 if not os.getenv("OPENAI_API_KEY"):
     raise ValueError("OPENAI_API_KEY environment variable is not set. Please set it in your .env file.")
 
+# Define a context class to store conversation history
+@dataclass
+class BrainstormingContext:
+    """Context class to store conversation history and brainstorming session data."""
+    conversation_history: List[Dict[str, str]] = field(default_factory=list)
+    topic: Optional[str] = None
+    ideas_discussed: List[str] = field(default_factory=list)
+    
+    def add_message(self, role: str, content: str) -> None:
+        """Add a message to the conversation history."""
+        self.conversation_history.append({"role": role, "content": content})
+    
+    def add_idea(self, idea: str) -> None:
+        """Add an idea to the list of ideas discussed."""
+        self.ideas_discussed.append(idea)
+    
+    def get_conversation_summary(self) -> str:
+        """Get a string summary of the conversation history."""
+        return "\n".join([f"{msg['role']}: {msg['content']}" for msg in self.conversation_history])
+
 # Define tools for the agent
 @function_tool
-def summarize_ideas(ideas: List[str]) -> str:
+def summarize_ideas(wrapper: RunContextWrapper[BrainstormingContext]) -> str:
     """
-    Summarize a list of ideas discussed in the brainstorming session.
+    Summarize the ideas discussed in the brainstorming session so far.
     
-    Args:
-        ideas: A list of ideas to summarize
-        
     Returns:
         A concise summary of the ideas
     """
-    return f"Here's a summary of the {len(ideas)} ideas we've discussed so far."
+    context = wrapper.context
+    if not context.ideas_discussed:
+        return "We haven't recorded any specific ideas yet. Let's continue brainstorming!"
+    
+    return f"Here's a summary of the {len(context.ideas_discussed)} ideas we've discussed so far:\n" + \
+           "\n".join([f"- {idea}" for idea in context.ideas_discussed])
 
 @function_tool
-def suggest_brainstorming_technique(current_topic: str, stuck_level: int) -> str:
+def save_idea(wrapper: RunContextWrapper[BrainstormingContext], idea: str) -> str:
     """
-    Suggest a brainstorming technique based on the current topic and how stuck the user feels.
+    Save an important idea from the conversation.
     
     Args:
-        current_topic: The topic being brainstormed
+        idea: The idea to save
+        
+    Returns:
+        Confirmation that the idea was saved
+    """
+    wrapper.context.add_idea(idea)
+    return f"I've saved the idea: '{idea}'"
+
+@function_tool
+def suggest_brainstorming_technique(
+    wrapper: RunContextWrapper[BrainstormingContext], 
+    stuck_level: int
+) -> str:
+    """
+    Suggest a brainstorming technique based on how stuck the user feels.
+    
+    Args:
         stuck_level: How stuck the user feels (1-5, where 5 is completely stuck)
         
     Returns:
         A suggestion for a brainstorming technique
     """
+    current_topic = wrapper.context.topic or "your current topic"
+    
     techniques = {
         1: "Mind Mapping: Start with your central idea and branch out with related concepts.",
         2: "SCAMPER: Consider how you can Substitute, Combine, Adapt, Modify, Put to other use, Eliminate, or Reverse aspects of your idea.",
@@ -58,10 +98,29 @@ def suggest_brainstorming_technique(current_topic: str, stuck_level: int) -> str
     
     return f"For your topic '{current_topic}', you might try: {techniques.get(stuck_level, techniques[3])}"
 
-# Define the brainstorming agent
-brainstorm_agent = Agent(
-    name="Brainstorming Assistant",
-    instructions="""
+@function_tool
+def set_brainstorming_topic(
+    wrapper: RunContextWrapper[BrainstormingContext], 
+    topic: str
+) -> str:
+    """
+    Set or update the brainstorming topic.
+    
+    Args:
+        topic: The topic to brainstorm about
+        
+    Returns:
+        Confirmation that the topic was set
+    """
+    wrapper.context.topic = topic
+    return f"I've set our brainstorming topic to: '{topic}'"
+
+# Create a dynamic instructions function that includes context
+def dynamic_instructions(agent: Agent[BrainstormingContext], wrapper: RunContextWrapper[BrainstormingContext]) -> str:
+    """
+    Generate dynamic instructions that include the current conversation context.
+    """
+    instructions = """
     You are a helpful brainstorming assistant that asks thought-provoking questions to help users develop their ideas.
     
     Your primary goals are to:
@@ -80,15 +139,38 @@ brainstorm_agent = Agent(
     - Remember all context from the current session
     - When appropriate, summarize the ideas discussed so far
     - If the user seems stuck, suggest a specific brainstorming technique
+    - Use the save_idea tool when the user shares a notable idea
+    - Use the set_brainstorming_topic tool when you identify the main topic
     
     Avoid:
     - Dominating the conversation with too many suggestions
     - Criticizing or judging ideas prematurely
     - Shifting topics too quickly before fully exploring an idea
     - Asking closed-ended (yes/no) questions
-    """,
+    """
+    
+    # Add topic if set
+    if wrapper.context.topic:
+        instructions += f"\n\nCURRENT BRAINSTORMING TOPIC: {wrapper.context.topic}"
+    
+    # Add ideas if any have been recorded
+    if wrapper.context.ideas_discussed:
+        instructions += "\n\nIDEAS DISCUSSED SO FAR:\n"
+        instructions += "\n".join([f"- {idea}" for idea in wrapper.context.ideas_discussed])
+    
+    return instructions
+
+# Define the brainstorming agent
+brainstorm_agent = Agent[BrainstormingContext](
+    name="Brainstorming Assistant",
+    instructions=dynamic_instructions,
     model="gpt-4o-mini",
-    tools=[summarize_ideas, suggest_brainstorming_technique],
+    tools=[
+        summarize_ideas,
+        save_idea,
+        suggest_brainstorming_technique,
+        set_brainstorming_topic
+    ],
 )
 
 async def interactive_brainstorming_session():
@@ -99,7 +181,8 @@ async def interactive_brainstorming_session():
     print("Type 'exit' or 'quit' to end the session.")
     print("Let's start brainstorming! What topic would you like to explore today?\n")
     
-    conversation_history = []
+    # Initialize context
+    context = BrainstormingContext()
     
     while True:
         # Get user input
@@ -111,20 +194,20 @@ async def interactive_brainstorming_session():
             break
         
         # Add user input to conversation history
-        conversation_history.append({"role": "user", "content": user_input})
+        context.add_message("user", user_input)
         
-        # Run the agent with the current user input
+        # Run the agent with the current context
         result = await Runner.run(
-            brainstorm_agent, 
+            brainstorm_agent,
             input=user_input,
-            context={"conversation_history": conversation_history}
+            context=context
         )
         
         # Display agent's response
         print(f"\nBrainstorming Assistant: {result.final_output}")
         
         # Add agent's response to conversation history
-        conversation_history.append({"role": "assistant", "content": result.final_output})
+        context.add_message("assistant", result.final_output)
 
 def main():
     """
